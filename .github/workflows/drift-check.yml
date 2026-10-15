@@ -1,0 +1,65 @@
+# Weekly drift check: plans against the live stack and fails if it no longer matches the code.
+# If someone changed the stack outside Terraform (for example in the console),
+# the run fails and GitHub emails you.
+name: drift-check
+
+on:
+  schedule:
+    - cron: "0 22 * * 0" # Sunday 22:00 UTC = Monday 9am in Sydney during daylight saving
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.16.5"
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_github_repo: ${{ github.repository }}
+
+jobs:
+  drift:
+    name: drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (CI user keys from GitHub secrets)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: infra
+        run: >-
+          terraform init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Check for drift
+        working-directory: infra
+        run: |
+          if [ -z "$(terraform state list)" ]; then
+            echo "The stack is not deployed (empty state), so there is nothing to check."
+            exit 0
+          fi
+
+          set +e
+          terraform plan -input=false -no-color -lock=false -detailed-exitcode > plan.txt
+          code=$?
+          set -e
+          cat plan.txt
+
+          if [ "$code" -eq 2 ]; then
+            echo "::error::Drift detected: the live stack no longer matches the code. Review the plan above."
+            exit 1
+          fi
+          exit "$code"

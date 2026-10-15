@@ -1,0 +1,92 @@
+# Runs when a change lands on main. The job uses the "production" environment,
+# so it waits for your approval, then applies Terraform, runs the SQL
+# migrations and finishes with a smoke test.
+name: terraform-apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "sql/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-main # one apply or destroy at a time
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.16.5"
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_github_repo: ${{ github.repository }}
+
+jobs:
+  apply:
+    name: apply
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (CI user keys from GitHub secrets)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: infra
+        run: >-
+          terraform init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="region=${{ vars.AWS_REGION }}"
+
+      # Plan again here rather than reusing the PR plan: main may have moved on
+      # since the PR was opened, and this plan is exactly what gets applied.
+      - name: Terraform plan
+        working-directory: infra
+        run: terraform plan -input=false -no-color -lock-timeout=5m -out=tfplan
+
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -no-color -lock-timeout=5m tfplan
+
+      - name: Read Terraform outputs
+        id: tf
+        working-directory: infra
+        run: |
+          {
+            echo "workgroup=$(terraform output -raw workgroup_name)"
+            echo "database=$(terraform output -raw database_name)"
+            echo "secret_arn=$(terraform output -raw admin_secret_arn)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run SQL migrations
+        env:
+          WORKGROUP: ${{ steps.tf.outputs.workgroup }}
+          DATABASE: ${{ steps.tf.outputs.database }}
+          SECRET_ARN: ${{ steps.tf.outputs.secret_arn }}
+        run: |
+          for file in sql/migrations/*.sql; do
+            bash scripts/run_sql.sh "$file"
+          done
+
+      - name: Smoke test
+        env:
+          WORKGROUP: ${{ steps.tf.outputs.workgroup }}
+          DATABASE: ${{ steps.tf.outputs.database }}
+          SECRET_ARN: ${{ steps.tf.outputs.secret_arn }}
+        run: bash scripts/run_sql.sh sql/smoke_test.sql --expect-rows
